@@ -72,6 +72,23 @@ fn enough_pages(display_list: &[Page], rule: StopRule) -> bool {
         .count() >= rule.pages_after
 }
 
+/// A forced page break (`page-break-before` or `-after: always`): the next
+/// content starts at the top of a new page. On a page that shows nothing
+/// yet (the start of a chapter, or right after another break) no new page
+/// is started: the anchors already there stay with the content, rather
+/// than making a blank page of their own. (Project Gutenberg's EPUB of
+/// Aristotle's Politics starts its text with `<header id="pg-header"><h2>`
+/// and breaks before every `h2`: a blank second page.)
+fn force_page_break(display_list: &mut Vec<Page>, draw_state: &mut DrawState, root_data: &RootData) {
+    let shows_something = display_list.last().map_or(false, |page| {
+        page.iter().any(|dc| !matches!(dc, DrawCommand::Marker(_)))
+    });
+    if shows_something {
+        display_list.push(Vec::new());
+    }
+    draw_state.position.y = root_data.rect.min.y;
+}
+
 pub trait ResourceFetcher {
     fn fetch(&mut self, name: &str) -> Result<Vec<u8>, Error>;
 }
@@ -368,8 +385,7 @@ impl Engine {
         style.width = width;
 
         if resumed.is_none() && props.get("page-break-before").map(String::as_str) == Some("always") {
-            display_list.push(Vec::new());
-            draw_state.position.y = root_data.rect.min.y;
+            force_page_break(display_list, draw_state, root_data);
         }
 
         if resumed.is_none() {
@@ -614,8 +630,7 @@ impl Engine {
         draw_state.position.y += style.padding.bottom;
 
         if props.get("page-break-after").map(String::as_str) == Some("always") {
-            display_list.push(Vec::new());
-            draw_state.position.y = root_data.rect.min.y;
+            force_page_break(display_list, draw_state, root_data);
         }
 
         ChildArtifact {
