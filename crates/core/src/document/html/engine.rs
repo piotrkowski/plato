@@ -72,6 +72,26 @@ fn enough_pages(display_list: &[Page], rule: StopRule) -> bool {
         .count() >= rule.pages_after
 }
 
+/// The language an element declares with `xml:lang` or `lang`. The
+/// document's own language (on `html` and `body`) is decided once for the
+/// whole book, from its metadata or the reader's choice.
+fn element_language(node: NodeRef) -> Option<String> {
+    if matches!(node.tag_name(), Some("html") | Some("body")) {
+        return None;
+    }
+    node.attribute("xml:lang")
+        .or_else(|| node.attribute("lang"))
+        .map(str::trim)
+        .filter(|lang| !lang.is_empty())
+        .map(String::from)
+}
+
+/// The hyphenation patterns for `language` (English without one).
+fn hyphenation_patterns(language: Option<&str>) -> Option<&'static Standard> {
+    hyph_lang(language.unwrap_or(DEFAULT_HYPH_LANG))
+        .and_then(|lang| HYPHENATION_PATTERNS.get(&lang))
+}
+
 /// A forced page break (`page-break-before` or `-after: always`): the next
 /// content starts at the top of a new page. On a page that shows nothing
 /// yet (the start of a chapter, or right after another break) no new page
@@ -257,6 +277,7 @@ impl Engine {
         }
 
         style.language = props.get("lang").cloned()
+                              .or_else(|| element_language(node))
                               .or_else(|| parent_style.language.clone());
 
         style.font_size = props.get("font-size")
@@ -698,7 +719,9 @@ impl Engine {
                 style.line_height = parent_style.line_height;
                 style.text_indent = parent_style.text_indent;
                 style.retain_whitespace = parent_style.retain_whitespace;
-                style.language = parent_style.language.clone();
+                style.language = props.get("lang").cloned()
+                                      .or_else(|| element_language(node))
+                                      .or_else(|| parent_style.language.clone());
                 style.uri = parent_style.uri.clone();
 
                 style.display = props.get("display").and_then(|value| parse_display(value))
@@ -1232,9 +1255,11 @@ impl Engine {
         let mut glue_drifts = Vec::new();
 
         if bps.is_empty() && style.text_align != TextAlign::Center {
-            if let Some(dictionary) = hyph_lang(style.language.as_ref().map_or(DEFAULT_HYPH_LANG, String::as_str))
-                                               .and_then(|lang| HYPHENATION_PATTERNS.get(&lang)) {
-                items = self.hyphenate_paragraph(style, dictionary, items, &mut hyph_indices);
+            let hyphenable = items.iter().any(|itm| matches!(itm,
+                ParagraphItem::Box { data: ParagraphElement::Text(element), .. }
+                    if hyphenation_patterns(element.language.as_deref()).is_some()));
+            if hyphenable {
+                items = self.hyphenate_paragraph(style, items, &mut hyph_indices);
                 bps = total_fit(&items, &line_lengths, self.stretch_tolerance, 0);
             }
         }
@@ -1596,12 +1621,19 @@ impl Engine {
         }
     }
 
-    fn hyphenate_paragraph(&mut self, style: &StyleData, dictionary: &Standard, items: Vec<ParagraphItem<ParagraphElement>>, hyph_indices: &mut Vec<[usize; 2]>) -> Vec<ParagraphItem<ParagraphElement>> {
+    fn hyphenate_paragraph(&mut self, style: &StyleData, items: Vec<ParagraphItem<ParagraphElement>>, hyph_indices: &mut Vec<[usize; 2]>) -> Vec<ParagraphItem<ParagraphElement>> {
         let mut hyph_items = Vec::with_capacity(items.len());
 
         for itm in items {
-            match itm {
-                ParagraphItem::Box { data: ParagraphElement::Text(ref element), .. } => {
+            // Each piece of text with the patterns of its own language,
+            // and none for a language without patterns.
+            let dictionary = match &itm {
+                ParagraphItem::Box { data: ParagraphElement::Text(element), .. } =>
+                    hyphenation_patterns(element.language.as_deref()),
+                _ => None,
+            };
+            match (itm, dictionary) {
+                (ParagraphItem::Box { data: ParagraphElement::Text(ref element), .. }, Some(dictionary)) => {
                     let text = &element.text;
                     let (hyphen_width, stretch) = {
                         let font = self.fonts.as_mut().unwrap()
@@ -1664,7 +1696,7 @@ impl Engine {
                                                            .unwrap_or_else(|| text.len());
                     }
                 },
-                _ => { hyph_items.push(itm) },
+                (itm, _) => { hyph_items.push(itm) },
             }
         }
 
