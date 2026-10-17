@@ -38,6 +38,40 @@ const DEFAULT_HEIGHT: u32 = 1872;
 
 pub type Page = Vec<DrawCommand>;
 
+// Interruptible layout (Aristotle): a long spine item can be laid out only up
+// to the pages needed, and resumed later from where it stopped. The layout
+// stops only between two children of a block (never inside a paragraph or a
+// table), and resuming replays exactly the operations a full layout would
+// have done, so page breaks are identical.
+
+/// When to stop: once `pages_after` complete pages start after `offset`.
+#[derive(Debug, Clone, Copy)]
+pub struct StopRule {
+    pub offset: usize,
+    pub pages_after: usize,
+}
+
+/// The state of one block loop at the point the layout stopped.
+#[derive(Debug, Clone)]
+pub struct ResumeFrame {
+    // Index of the element child to continue with (which has a frame of
+    // its own if it was interrupted inside).
+    next: usize,
+    // The loop context to continue with.
+    loop_context: LoopContext,
+    // The rectangles of the block so far.
+    rects: Vec<Option<Rectangle>>,
+}
+
+/// Whether `display_list` holds enough complete pages for `rule`: every
+/// page but the last one, which may still grow, is complete.
+fn enough_pages(display_list: &[Page], rule: StopRule) -> bool {
+    let complete = display_list.len().saturating_sub(1);
+    display_list[..complete].iter()
+        .filter(|page| page.first().map_or(false, |dc| dc.offset() > rule.offset))
+        .count() >= rule.pages_after
+}
+
 pub trait ResourceFetcher {
     fn fetch(&mut self, name: &str) -> Result<Vec<u8>, Error>;
 }
@@ -62,6 +96,12 @@ pub struct Engine {
     pub dims: (u32, u32),
     // Device DPI.
     pub dpi: u16,
+    // Interruptible layout: when to stop, the frames left by the last stop
+    // (innermost first), and the frames to resume from (popped as the
+    // layout descends, outermost last).
+    pub stop: Option<StopRule>,
+    pub stopped: Vec<ResumeFrame>,
+    pub resume: Vec<ResumeFrame>,
 }
 
 impl Engine {
@@ -79,6 +119,9 @@ impl Engine {
             line_height,
             dims: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
             dpi: DEFAULT_DPI,
+            stop: None,
+            stopped: Vec::new(),
+            resume: Vec::new(),
         }
     }
 
@@ -139,10 +182,27 @@ impl Engine {
         rect![0, 0, width as i32, height as i32]
     }
 
+    // Whether an interruptible layout may stop in the block loop of `node`
+    // now: never inside a table, whose cells are merged afterwards.
+    fn stop_now(&self, node: NodeRef, display_list: &[Page]) -> bool {
+        match self.stop {
+            Some(rule) => enough_pages(display_list, rule) &&
+                          node.tag_name() != Some("table") &&
+                          !node.ancestor_elements().any(|n| n.tag_name() == Some("table")),
+            None => false,
+        }
+    }
+
     pub fn build_display_list(&mut self, node: NodeRef, parent_style: &StyleData, loop_context: &LoopContext, stylesheet: &StyleSheet, root_data: &RootData, resource_fetcher: &mut dyn ResourceFetcher, draw_state: &mut DrawState, display_list: &mut Vec<Page>) -> ChildArtifact {
         // TODO: border, background, text-transform, tab-size, text-decoration.
+        // A call on the path of an interrupted layout continues it: what it
+        // did before the interruption is not done again.
+        let mut resumed = self.resume.pop();
         let mut style = StyleData::default();
-        let mut rects: Vec<Option<Rectangle>> = vec![None];
+        let mut rects: Vec<Option<Rectangle>> = match resumed.as_mut() {
+            Some(frame) => std::mem::take(&mut frame.rects),
+            None => vec![None],
+        };
 
         let props = specified_values(node, stylesheet);
 
@@ -307,17 +367,19 @@ impl Engine {
 
         style.width = width;
 
-        if props.get("page-break-before").map(String::as_str) == Some("always") {
+        if resumed.is_none() && props.get("page-break-before").map(String::as_str) == Some("always") {
             display_list.push(Vec::new());
             draw_state.position.y = root_data.rect.min.y;
         }
 
-        draw_state.position.y += style.padding.top;
+        if resumed.is_none() {
+            draw_state.position.y += style.padding.top;
+        }
 
         let has_blocks = node.children().any(|n| n.is_block());
 
         if has_blocks {
-            if node.id().is_some() {
+            if resumed.is_none() && node.id().is_some() {
                 display_list.last_mut().unwrap()
                             .push(DrawCommand::Marker(root_data.start_offset + node.offset()));
             }
@@ -434,6 +496,14 @@ impl Engine {
                     let is_list_item = node.tag_name() == Some("li");
                     let mut index = 0;
 
+                    if let Some(frame) = resumed.take() {
+                        for _ in 0..frame.next {
+                            iter.next();
+                        }
+                        index = frame.next;
+                        inner_loop_context = frame.loop_context;
+                    }
+
                     while let Some(child) = iter.next() {
                         if iter.peek().is_none() {
                             inner_loop_context.is_last = true;
@@ -445,7 +515,19 @@ impl Engine {
                             inner_loop_context.index = loop_context.index;
                         }
 
+                        let passed = if self.stop.is_some() { Some(inner_loop_context.clone()) } else { None };
                         let artifact = self.build_display_list(child, &style, &inner_loop_context, stylesheet, root_data, resource_fetcher, draw_state, display_list);
+
+                        // The child stopped inside: continue into it later.
+                        if !self.stopped.is_empty() {
+                            self.stopped.push(ResumeFrame {
+                                next: index,
+                                loop_context: passed.unwrap_or_default(),
+                                rects,
+                            });
+                            return ChildArtifact { sibling_style: SiblingStyle::default(), rects: Vec::new() };
+                        }
+
                         inner_loop_context.sibling_style = artifact.sibling_style;
                         inner_loop_context.is_first = false;
 
@@ -469,7 +551,17 @@ impl Engine {
                             }
                         }
 
-                        index += 1
+                        index += 1;
+
+                        // Enough pages: stop before the next child.
+                        if iter.peek().is_some() && self.stop_now(node, display_list) {
+                            self.stopped.push(ResumeFrame {
+                                next: index,
+                                loop_context: inner_loop_context.clone(),
+                                rects,
+                            });
+                            return ChildArtifact { sibling_style: SiblingStyle::default(), rects: Vec::new() };
+                        }
                     }
                 }
             }

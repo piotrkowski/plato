@@ -13,7 +13,7 @@ use crate::unit::pt_to_px;
 use crate::geom::{Boundary, CycleDir};
 use super::pdf::PdfOpener;
 use super::html::dom::{XmlTree, NodeRef};
-use super::html::engine::{Page, Engine, ResourceFetcher};
+use super::html::engine::{Page, Engine, ResourceFetcher, ResumeFrame, StopRule};
 use super::html::layout::{StyleData, LoopContext};
 use super::html::layout::{RootData, DrawState, DrawCommand, TextCommand, ImageCommand};
 use super::html::layout::TextAlign;
@@ -42,9 +42,32 @@ pub struct EpubDocument {
     engine: Engine,
     spine: Vec<Chunk>,
     cache: FxHashMap<usize, Vec<Page>>,
+    // Spine items laid out only partly (Aristotle): their pages so far are in
+    // `cache`, and what is needed to go on is here.
+    partial: FxHashMap<usize, Partial>,
     ignore_document_css: bool,
     language_override: Option<String>,
 }
+
+// A spine item laid out up to some page: its document, its styles and the
+// layout state where the engine stopped.
+struct Partial {
+    tree: XmlTree,
+    stylesheet: StyleSheet,
+    style: StyleData,
+    root_data: RootData,
+    draw_state: DrawState,
+    // The page being filled.
+    display_list: Vec<Page>,
+    resume: Vec<ResumeFrame>,
+    body_offset: usize,
+    runs: usize,
+}
+
+// Pages laid out past the one asked for: on the first layout of a spine
+// item, and when continuing it.
+const FIRST_LOOKAHEAD: usize = 2;
+const LOOKAHEAD: usize = 8;
 
 #[derive(Debug)]
 struct Chunk {
@@ -124,6 +147,7 @@ impl EpubDocument {
             engine: Engine::new(),
             spine,
             cache: FxHashMap::default(),
+            partial: FxHashMap::default(),
             ignore_document_css: false,
             language_override: None,
         })
@@ -134,6 +158,7 @@ impl EpubDocument {
     pub fn set_language(&mut self, language: Option<String>) {
         self.language_override = language;
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn offset(&self, index: usize) -> usize {
@@ -264,10 +289,7 @@ impl EpubDocument {
 
     #[inline]
     fn page_index(&mut self, offset: usize, index: usize, start_offset: usize) -> Option<usize> {
-        if !self.cache.contains_key(&index) {
-            let display_list = self.build_display_list(index, start_offset);
-            self.cache.insert(index, display_list);
-        }
+        self.ensure(index, start_offset, Some(offset));
         self.cache.get(&index).map(|display_list| {
             if display_list.len() < 2 || display_list[1].first().map(|dc| offset < dc.offset()) == Some(true) {
                 return 0;
@@ -320,7 +342,79 @@ impl EpubDocument {
         }
     }
 
-    fn build_display_list(&mut self, index: usize, start_offset: usize) -> Vec<Page> {
+    // Lay out the pages of spine item `index` up to the one holding
+    // `offset` and a few after it, or all of them without an offset.
+    // Continues where an earlier call stopped.
+    fn ensure(&mut self, index: usize, start_offset: usize, offset: Option<usize>) {
+        if self.cache.contains_key(&index) && !self.partial.contains_key(&index) {
+            return;
+        }
+        let mut p = match self.partial.remove(&index) {
+            Some(p) => p,
+            None => match self.start_layout(index, start_offset) {
+                Ok(p) => {
+                    self.cache.insert(index, Vec::new());
+                    p
+                },
+                Err(pages) => {
+                    self.cache.insert(index, pages);
+                    return;
+                },
+            },
+        };
+        let stop = match offset {
+            Some(offset) => {
+                let after = self.cache.get(&index).map_or(0, |pages| {
+                    pages.iter().filter(|page| page.first().map_or(false, |dc| dc.offset() > offset)).count()
+                });
+                if after >= FIRST_LOOKAHEAD {
+                    self.partial.insert(index, p);
+                    return;
+                }
+                let want = if p.runs == 0 { FIRST_LOOKAHEAD } else { LOOKAHEAD };
+                Some(StopRule { offset, pages_after: want - after })
+            },
+            None => None,
+        };
+        let done = self.continue_layout(&mut p, stop);
+        p.runs += 1;
+        // Every page but the one being filled is complete.
+        let current = p.display_list.pop().unwrap_or_default();
+        let complete = std::mem::replace(&mut p.display_list, vec![current]);
+        let cached = self.cache.entry(index).or_default();
+        cached.extend(complete.into_iter().filter(|page| !page.is_empty()));
+        if done {
+            if let Some(last) = p.display_list.pop().filter(|page| !page.is_empty()) {
+                cached.push(last);
+            }
+            if cached.is_empty() {
+                cached.push(vec![DrawCommand::Marker(p.root_data.start_offset + p.body_offset)]);
+            }
+        } else {
+            self.partial.insert(index, p);
+        }
+    }
+
+    // Go on laying out a partly laid out spine item, until `stop` says
+    // enough. Returns whether it is complete.
+    fn continue_layout(&mut self, p: &mut Partial, stop: Option<StopRule>) -> bool {
+        let body = match p.tree.root().find("body") {
+            Some(body) => body,
+            None => return true,
+        };
+        self.engine.stop = stop;
+        self.engine.stopped.clear();
+        self.engine.resume = std::mem::take(&mut p.resume);
+        self.engine.build_display_list(body, &p.style, &LoopContext::default(), &p.stylesheet, &p.root_data, &mut self.archive, &mut p.draw_state, &mut p.display_list);
+        self.engine.stop = None;
+        self.engine.resume.clear();
+        p.resume = std::mem::take(&mut self.engine.stopped);
+        p.resume.is_empty()
+    }
+
+    // Parse spine item `index` and set up its layout; its pages directly
+    // when it has no body.
+    fn start_layout(&mut self, index: usize, start_offset: usize) -> Result<Partial, Vec<Page>> {
         let mut text = String::new();
         let mut spine_dir = PathBuf::default();
 
@@ -375,9 +469,7 @@ impl EpubDocument {
             stylesheet.append(&mut inner_css, true);
         }
 
-        let mut display_list = Vec::new();
-
-        if let Some(body) = root.root().find("body") {
+        if let Some(body_offset) = root.root().find("body").map(|body| body.offset()) {
             let mut rect = self.engine.rect();
             rect.shrink(&self.engine.margin);
 
@@ -398,8 +490,7 @@ impl EpubDocument {
                 .. Default::default()
             };
 
-            let loop_context = LoopContext::default();
-            let mut draw_state = DrawState {
+            let draw_state = DrawState {
                 position: rect.min,
                 .. Default::default()
             };
@@ -410,20 +501,20 @@ impl EpubDocument {
                 rect,
             };
 
-            display_list.push(Vec::new());
-
-            self.engine.build_display_list(body, &style, &loop_context, &stylesheet, &root_data, &mut self.archive, &mut draw_state, &mut display_list);
-
-            display_list.retain(|page| !page.is_empty());
-
-            if display_list.is_empty() {
-                display_list.push(vec![DrawCommand::Marker(start_offset + body.offset())]);
-            }
+            Ok(Partial {
+                tree: root,
+                stylesheet,
+                style,
+                root_data,
+                draw_state,
+                display_list: vec![Vec::new()],
+                resume: Vec::new(),
+                body_offset,
+                runs: 0,
+            })
         } else {
-            display_list.push(vec![DrawCommand::Marker(start_offset)]);
+            Err(vec![vec![DrawCommand::Marker(start_offset)]])
         }
-
-        display_list
     }
 
     pub fn categories(&self) -> BTreeSet<String> {
@@ -742,10 +833,7 @@ impl Document for EpubDocument {
                         return None;
                     }
                     let (index, start_offset) = (index - 1, start_offset - self.spine[index-1].size);
-                    if !self.cache.contains_key(&index) {
-                        let display_list = self.build_display_list(index, start_offset);
-                        self.cache.insert(index, display_list);
-                    }
+                    self.ensure(index, start_offset, None);
                     self.cache.get(&index)
                         .and_then(|display_list| display_list.last().and_then(|page| page.first()).map(DrawCommand::offset))
                 }
@@ -760,10 +848,7 @@ impl Document for EpubDocument {
                         return None;
                     }
                     let (index, start_offset) = (index + 1, start_offset + self.spine[index].size);
-                    if !self.cache.contains_key(&index) {
-                        let display_list = self.build_display_list(index, start_offset);
-                        self.cache.insert(index, display_list);
-                    }
+                    self.ensure(index, start_offset, Some(start_offset));
                     self.cache.get(&index)
                         .and_then(|display_list| display_list.first().and_then(|page| page.first()).map(|dc| dc.offset()))
                 }
@@ -884,41 +969,49 @@ impl Document for EpubDocument {
     fn layout(&mut self, width: u32, height: u32, font_size: f32, dpi: u16) {
         self.engine.layout(width, height, font_size, dpi);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_text_align(&mut self, text_align: TextAlign) {
         self.engine.set_text_align(text_align);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_font_family(&mut self, family_name: &str, search_path: &str) {
         self.engine.set_font_family(family_name, search_path);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_margin_width(&mut self, width: i32) {
         self.engine.set_margin_width(width);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_line_height(&mut self, line_height: f32) {
         self.engine.set_line_height(line_height);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_hyphen_penalty(&mut self, hyphen_penalty: i32) {
         self.engine.set_hyphen_penalty(hyphen_penalty);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_stretch_tolerance(&mut self, stretch_tolerance: f32) {
         self.engine.set_stretch_tolerance(stretch_tolerance);
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn set_ignore_document_css(&mut self, ignore: bool) {
         self.ignore_document_css = ignore;
         self.cache.clear();
+        self.partial.clear();
     }
 
     fn title(&self) -> Option<String> {
