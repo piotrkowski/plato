@@ -3,6 +3,7 @@ use std::env;
 fn main() {
     let target = env::var("TARGET").unwrap();
     println!("cargo:rustc-check-cfg=cfg(mupdf_tofu)");
+    println!("cargo:rustc-check-cfg=cfg(plato_no_djvu)");
 
     // Cross-compiling for Kobo.
     if target == "arm-unknown-linux-gnueabihf" {
@@ -37,6 +38,11 @@ fn main() {
         let fonts = dirs.iter().find_map(|d| std::fs::read_to_string(d.join("mupdf-fonts")).ok());
         if fonts.as_deref().map(str::trim).is_some_and(|f| f != "full") {
             println!("cargo:rustc-cfg=mupdf_tofu");
+        }
+        // DjVu is optional: without libdjvulibre.a the djvu module is left
+        // out and DjVu files are not opened.
+        if !dirs.iter().any(|d| d.join("libdjvulibre.a").is_file()) {
+            println!("cargo:rustc-cfg=plato_no_djvu");
         }
         println!("cargo:rustc-link-lib=static=mupdf-third");
         println!("cargo:rustc-link-lib=static=c++");
