@@ -2,6 +2,7 @@ use std::env;
 
 fn main() {
     let target = env::var("TARGET").unwrap();
+    println!("cargo:rustc-check-cfg=cfg(mupdf_tofu)");
 
     // Cross-compiling for Kobo.
     if target == "arm-unknown-linux-gnueabihf" {
@@ -24,6 +25,19 @@ fn main() {
         }
         println!("cargo:rustc-link-search=native={}/target/mupdf_wrapper/Kindle", root);
         println!("cargo:rustc-link-search=native={}/libs", root);
+        // A MuPDF built without its Noto and CJK fonts (TOFU) says so in a
+        // `mupdf-fonts` file next to the archives; the fallback fonts that
+        // font/mod.rs takes from MuPDF are then left out.
+        let mut dirs: Vec<_> = env::var_os("PLATO_LIB_DIRS")
+            .map(|d| env::split_paths(&d).collect()).unwrap_or_default();
+        dirs.push(format!("{}/libs", root).into());
+        for dir in dirs.iter().filter(|d| d.is_dir()) {
+            println!("cargo:rerun-if-changed={}", dir.display());
+        }
+        let fonts = dirs.iter().find_map(|d| std::fs::read_to_string(d.join("mupdf-fonts")).ok());
+        if fonts.as_deref().map(str::trim).is_some_and(|f| f != "full") {
+            println!("cargo:rustc-cfg=mupdf_tofu");
+        }
         println!("cargo:rustc-link-lib=static=mupdf-third");
         println!("cargo:rustc-link-lib=static=c++");
         println!("cargo:rustc-link-lib=static=c++abi");

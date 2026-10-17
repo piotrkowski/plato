@@ -624,7 +624,7 @@ pub fn font_from_style<'a>(fonts: &'a mut Fonts, style: &Style, dpi: u16) -> &'a
 #[inline]
 unsafe fn font_data_from_script(script: HbScript) -> &'static [libc::c_uchar] {
     // Extracted from mupdf in source/fitz/noto.c
-    #[cfg(any(not(target_os = "linux"), target_arch = "arm", target_env = "musl"))]
+    #[cfg(all(any(not(target_os = "linux"), target_arch = "arm", target_env = "musl"), not(mupdf_tofu)))]
     match script {
         HB_SCRIPT_HANGUL |
         HB_SCRIPT_HIRAGANA |
@@ -794,7 +794,7 @@ unsafe fn font_data_from_script(script: HbScript) -> &'static [libc::c_uchar] {
         _ => &_binary_DroidSansFallback_ttf,
     }
 
-    #[cfg(all(target_os = "linux", not(target_arch = "arm"), not(target_env = "musl")))]
+    #[cfg(all(target_os = "linux", not(target_arch = "arm"), not(target_env = "musl"), not(mupdf_tofu)))]
     match script {
         HB_SCRIPT_HANGUL |
         HB_SCRIPT_HIRAGANA |
@@ -962,6 +962,23 @@ unsafe fn font_data_from_script(script: HbScript) -> &'static [libc::c_uchar] {
         HB_SYMBOL_EMOJI => &_binary_resources_fonts_noto_NotoEmoji_Regular_ttf_start,
 
         _ => &_binary_resources_fonts_droid_DroidSansFallback_ttf_start,
+    }
+
+    // MuPDF without its Noto and CJK fonts: two small fonts from the data
+    // directory stand in, Noto Sans Coptic for Coptic and a symbol font for
+    // the rest. A missing file means no fallback: the glyph keeps the
+    // font's .notdef.
+    #[cfg(mupdf_tofu)]
+    {
+        use std::sync::OnceLock;
+        static COPTIC: OnceLock<Vec<u8>> = OnceLock::new();
+        static SYMBOLS: OnceLock<Vec<u8>> = OnceLock::new();
+        let (cell, path) = if script == HB_SCRIPT_COPTIC {
+            (&COPTIC, "fonts/NotoSansCoptic-Regular.otf")
+        } else {
+            (&SYMBOLS, "fonts/DejaVuSans-Symbols.ttf")
+        };
+        cell.get_or_init(|| std::fs::read(path).unwrap_or_default())
     }
 }
 
@@ -1318,6 +1335,9 @@ impl Font {
                 }
             }
             let font_data = font_data_from_script(script);
+            if font_data.is_empty() {
+                continue;
+            }
             let mut face = ptr::null_mut();
             FT_New_Memory_Face((self.lib).0, font_data.as_ptr() as *const FtByte,
                                font_data.len() as libc::c_long, 0, &mut face);
