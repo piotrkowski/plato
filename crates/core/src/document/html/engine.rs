@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::convert::TryFrom;
 use anyhow::Error;
-use kl_hyphenate::{Standard, Hyphenator, Iter};
+use kl_hyphenate::{Standard, Hyphenator, Iter, Language};
 use paragraph_breaker::{Item as ParagraphItem, Breakpoint, INFINITE_PENALTY};
 use paragraph_breaker::{total_fit, standard_fit};
 use xi_unicode::LineBreakIterator;
@@ -86,10 +86,25 @@ fn element_language(node: NodeRef) -> Option<String> {
         .map(String::from)
 }
 
-/// The hyphenation patterns for `language` (English without one).
-fn hyphenation_patterns(language: Option<&str>) -> Option<&'static Standard> {
-    hyph_lang(language.unwrap_or(DEFAULT_HYPH_LANG))
-        .and_then(|lang| HYPHENATION_PATTERNS.get(&lang))
+/// Whether `text` is a Greek word: its first letter is in the Greek or
+/// Greek Extended block.
+fn is_greek(text: &str) -> bool {
+    text.chars().find(|c| c.is_alphabetic())
+        .map_or(false, |c| matches!(c, '\u{0370}'..='\u{03FF}' | '\u{1F00}'..='\u{1FFF}'))
+}
+
+/// The hyphenation patterns for `text` in `language` (English without
+/// one). A Greek word in a language with another script takes the Ancient
+/// Greek patterns, since that language's patterns have nothing for Greek
+/// letters: Greek quoted without a `lang` of its own, or a Greek chapter
+/// whose `lang` is on `html`, which keeps the book's language.
+fn hyphenation_patterns(language: Option<&str>, text: &str) -> Option<&'static Standard> {
+    let lang = hyph_lang(language.unwrap_or(DEFAULT_HYPH_LANG));
+    let greek = matches!(lang, Some(Language::GreekAncient | Language::GreekMono | Language::GreekPoly));
+    if !greek && is_greek(text) {
+        return HYPHENATION_PATTERNS.get(&Language::GreekAncient);
+    }
+    lang.and_then(|lang| HYPHENATION_PATTERNS.get(&lang))
 }
 
 /// A forced page break (`page-break-before` or `-after: always`): the next
@@ -1257,7 +1272,7 @@ impl Engine {
         if bps.is_empty() && style.text_align != TextAlign::Center {
             let hyphenable = items.iter().any(|itm| matches!(itm,
                 ParagraphItem::Box { data: ParagraphElement::Text(element), .. }
-                    if hyphenation_patterns(element.language.as_deref()).is_some()));
+                    if hyphenation_patterns(element.language.as_deref(), &element.text).is_some()));
             if hyphenable {
                 items = self.hyphenate_paragraph(style, items, &mut hyph_indices);
                 bps = total_fit(&items, &line_lengths, self.stretch_tolerance, 0);
@@ -1629,7 +1644,7 @@ impl Engine {
             // and none for a language without patterns.
             let dictionary = match &itm {
                 ParagraphItem::Box { data: ParagraphElement::Text(element), .. } =>
-                    hyphenation_patterns(element.language.as_deref()),
+                    hyphenation_patterns(element.language.as_deref(), &element.text),
                 _ => None,
             };
             match (itm, dictionary) {
