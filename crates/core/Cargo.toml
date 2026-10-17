@@ -19,7 +19,7 @@ serde_json = "1.0.149"
 titlecase = "3.6.0"
 unicode-normalization = "0.1.25"
 toml = "0.9.11"
-zip = { version = "7.0.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate-flate2"] }
 kl-hyphenate = "0.7.3"
 entities = "1.0.1"
 paragraph-breaker = "0.4.4"
