@@ -10,9 +10,18 @@ fn main() {
         println!("cargo:rustc-link-search=libs");
         println!("cargo:rustc-link-lib=dylib=stdc++");
     // Fully static Kindle build (Aristotle, tools/build-plato.sh): every C
-    // library is a static archive in libs/, built by Zig for musl.
-    } else if target == "armv7-unknown-linux-musleabihf" {
+    // library is a static archive in libs/, built by Zig for musl. The same
+    // archives built for x86_64 musl give a host build for previews.
+    // PLATO_LIB_DIRS (a PATH-style list) points other workspaces, such as
+    // Aristotle's aristotle-render, at the archives of a build-plato.sh run.
+    } else if target == "armv7-unknown-linux-musleabihf" || target == "x86_64-unknown-linux-musl" {
         let root = format!("{}/../..", env::var("CARGO_MANIFEST_DIR").unwrap());
+        println!("cargo:rerun-if-env-changed=PLATO_LIB_DIRS");
+        if let Some(dirs) = env::var_os("PLATO_LIB_DIRS") {
+            for dir in env::split_paths(&dirs) {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+            }
+        }
         println!("cargo:rustc-link-search=native={}/target/mupdf_wrapper/Kindle", root);
         println!("cargo:rustc-link-search=native={}/libs", root);
         println!("cargo:rustc-link-lib=static=mupdf-third");
