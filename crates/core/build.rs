@@ -9,6 +9,15 @@ fn main() {
         println!("cargo:rustc-link-search=target/mupdf_wrapper/Kobo");
         println!("cargo:rustc-link-search=libs");
         println!("cargo:rustc-link-lib=dylib=stdc++");
+    // Fully static Kindle build (Aristotle, tools/build-plato.sh): every C
+    // library is a static archive in libs/, built by Zig for musl.
+    } else if target == "armv7-unknown-linux-musleabihf" {
+        let root = format!("{}/../..", env::var("CARGO_MANIFEST_DIR").unwrap());
+        println!("cargo:rustc-link-search=native={}/target/mupdf_wrapper/Kindle", root);
+        println!("cargo:rustc-link-search=native={}/libs", root);
+        println!("cargo:rustc-link-lib=static=mupdf-third");
+        println!("cargo:rustc-link-lib=static=c++");
+        println!("cargo:rustc-link-lib=static=c++abi");
     // Handle the Linux and macOS platforms.
     } else {
         let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
