@@ -43,6 +43,7 @@ pub struct EpubDocument {
     spine: Vec<Chunk>,
     cache: FxHashMap<usize, Vec<Page>>,
     ignore_document_css: bool,
+    language_override: Option<String>,
 }
 
 #[derive(Debug)]
@@ -124,7 +125,15 @@ impl EpubDocument {
             spine,
             cache: FxHashMap::default(),
             ignore_document_css: false,
+            language_override: None,
         })
+    }
+
+    // Language used for hyphenation instead of the first dc:language, for
+    // books that declare several (some Polish books list de-DE first).
+    pub fn set_language(&mut self, language: Option<String>) {
+        self.language_override = language;
+        self.cache.clear();
     }
 
     fn offset(&self, index: usize) -> usize {
@@ -372,7 +381,7 @@ impl EpubDocument {
             let mut rect = self.engine.rect();
             rect.shrink(&self.engine.margin);
 
-            let language = self.language().or_else(|| {
+            let language = self.language_override.clone().or_else(|| self.language()).or_else(|| {
                 root.root().find("html")
                     .and_then(|html| html.attribute("xml:lang"))
                     .map(String::from)
