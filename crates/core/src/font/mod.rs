@@ -964,16 +964,20 @@ unsafe fn font_data_from_script(script: HbScript) -> &'static [libc::c_uchar] {
         _ => &_binary_resources_fonts_droid_DroidSansFallback_ttf_start,
     }
 
-    // MuPDF without its Noto and CJK fonts: two small fonts from the data
-    // directory stand in, Noto Sans Coptic for Coptic and a symbol font for
-    // the rest. A missing file means no fallback: the glyph keeps the
-    // font's .notdef.
+    // MuPDF without its Noto and CJK fonts: small fonts from the data
+    // directory stand in, Literata for Latin and Greek (a body font chosen
+    // by the reader may lack Polish or Greek letters), Noto Sans Coptic for
+    // Coptic and a symbol font for the rest. A missing file means no
+    // fallback: the glyph keeps the font's .notdef.
     #[cfg(mupdf_tofu)]
     {
         use std::sync::OnceLock;
+        static SERIF: OnceLock<Vec<u8>> = OnceLock::new();
         static COPTIC: OnceLock<Vec<u8>> = OnceLock::new();
         static SYMBOLS: OnceLock<Vec<u8>> = OnceLock::new();
-        let (cell, path) = if script == HB_SCRIPT_COPTIC {
+        let (cell, path) = if script == HB_SCRIPT_LATIN || script == HB_SCRIPT_GREEK {
+            (&SERIF, "serif/Literata-Regular.ttf")
+        } else if script == HB_SCRIPT_COPTIC {
             (&COPTIC, "fonts/NotoSansCoptic-Regular.otf")
         } else {
             (&SYMBOLS, "fonts/DejaVuSans-Symbols.ttf")
